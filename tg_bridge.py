@@ -18,7 +18,7 @@ from pathlib import Path
 
 from aiohttp import web
 from PIL import Image
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
 from telethon.errors import (
     FloodWaitError,
     PasswordHashInvalidError,
@@ -29,6 +29,10 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.account import GetPasswordRequest
+from telethon.tl.types import PeerChannel, PeerChat, PeerUser
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -235,22 +239,38 @@ def can_write_entity(ent) -> bool:
 
 async def resolve_peer(cli: TelegramClient, chat_ref: str, username: str = ""):
     ref = str(chat_ref).strip()
+    if ref.lower() == "me":
+        return "me"
     if ref.lstrip("-").isdigit():
         target_id = int(ref)
         try:
+            me = await cli.get_me()
+            if me and int(me.id) == target_id:
+                return "me"
+        except Exception:
+            pass
+        try:
             return await cli.get_input_entity(target_id)
         except Exception:
-            uname = str(username or "").strip().lstrip("@")
-            if uname:
-                try:
-                    return await cli.get_input_entity(uname)
-                except Exception:
-                    pass
-            dialogs = await cli.get_dialogs(limit=60)
-            for d in dialogs:
-                if int(d.id) == target_id:
+            pass
+        uname = str(username or "").strip().lstrip("@")
+        if uname:
+            try:
+                return await cli.get_input_entity(uname)
+            except Exception:
+                pass
+        dialogs = await cli.get_dialogs(limit=100)
+        for d in dialogs:
+            try:
+                if int(d.id) == target_id or utils.get_peer_id(d.entity) == target_id:
                     return d.input_entity
-            return await cli.get_entity(target_id)
+            except Exception:
+                continue
+        if ref.startswith("-100") and len(ref) > 4:
+            return await cli.get_input_entity(PeerChannel(int(ref[4:])))
+        if target_id < 0:
+            return await cli.get_input_entity(PeerChat(abs(target_id)))
+        return await cli.get_input_entity(PeerUser(target_id))
     uname = ref.lstrip("@")
     try:
         return await cli.get_input_entity(uname if ref.startswith("@") else ref)
@@ -583,24 +603,44 @@ async def handle_updates(request: web.Request) -> web.Response:
             return json_resp({"ok": False, "error": clean_text(str(exc), 80)}, status=500)
 
 
+async def _do_send_text(cli: TelegramClient, chat_id: str, username: str, text: str) -> web.Response:
+    if not chat_id or not text:
+        return json_resp({"ok": False, "error": "chat_id/text required"}, status=400)
+    peer = await resolve_peer(cli, chat_id, username)
+    msg = await cli.send_message(peer, text)
+    print(f"[Send] OK to {chat_id} msg_id={msg.id}", flush=True)
+    return json_resp({"ok": True, "id": int(msg.id)})
+
+
 async def handle_send(request: web.Request) -> web.Response:
     cli = await get_authed_client(request)
     if cli is None:
         return json_resp({"ok": False, "error": "unauthorized"}, status=401)
     async with get_session_lock(get_session_hdr(request)):
         try:
-            body = await request.json()
+            raw = await request.read()
+            body = json.loads(raw.decode("utf-8", errors="replace"))
             chat_id = str(body.get("chat_id", "")).strip()
             username = str(body.get("username", "")).strip()
             text = str(body.get("text", ""))
-            if not chat_id or not text:
-                return json_resp({"ok": False, "error": "chat_id/text required"}, status=400)
-            peer = await resolve_peer(cli, chat_id, username)
-            msg = await cli.send_message(peer, text)
-            print(f"[Send] OK to {chat_id} msg_id={msg.id}")
-            return json_resp({"ok": True, "id": int(msg.id)})
+            return await _do_send_text(cli, chat_id, username, text)
         except Exception as exc:
-            print(f"[Send] ERR to {request.remote}: {exc}")
+            print(f"[Send] ERR POST: {exc}", flush=True)
+            return json_resp({"ok": False, "error": clean_text(str(exc), 80)}, status=400)
+
+
+async def handle_send_get(request: web.Request) -> web.Response:
+    cli = await get_authed_client(request)
+    if cli is None:
+        return json_resp({"ok": False, "error": "unauthorized"}, status=401)
+    async with get_session_lock(get_session_hdr(request)):
+        try:
+            chat_id = request.query.get("chat_id", "").strip()
+            username = request.query.get("username", "").strip()
+            text = request.query.get("text", "")
+            return await _do_send_text(cli, chat_id, username, text)
+        except Exception as exc:
+            print(f"[Send] ERR GET: {exc}", flush=True)
             return json_resp({"ok": False, "error": clean_text(str(exc), 80)}, status=400)
 
 
@@ -701,6 +741,7 @@ async def run_server():
     app.router.add_get("/chats", handle_chats)
     app.router.add_get("/messages", handle_messages)
     app.router.add_get("/updates", handle_updates)
+    app.router.add_get("/send_msg", handle_send_get)
     app.router.add_post("/send", handle_send)
     app.router.add_post("/send_photo", handle_send_photo)
     app.router.add_get("/photo", handle_photo)
