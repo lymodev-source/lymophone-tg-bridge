@@ -14,11 +14,12 @@ import os
 import socket
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 from aiohttp import web
 from PIL import Image
-from telethon import TelegramClient, utils
+from telethon import TelegramClient, events, utils
 from telethon.errors import (
     FloodWaitError,
     PasswordHashInvalidError,
@@ -55,6 +56,15 @@ session_locks: dict[str, asyncio.Lock] = {}
 MAX_CACHED_CLIENTS = 25
 CLIENT_IDLE_SEC = 600.0
 FLOW_TTL_SEC = 900.0
+MAX_MEDIA_BYTES = 4 * 1024 * 1024
+MAX_UPLOAD_PHOTO_BYTES = 1024 * 1024
+
+# Fast per-session peer cache & live incoming event queues (0 ms /updates & peer lookup)
+peer_cache: dict[str, dict[str, object]] = {}
+inbox_queues: dict[str, deque] = {}
+session_max_id: dict[str, int] = {}
+last_dialog_sync: dict[str, float] = {}
+attached_clients: set[int] = set()
 
 
 def get_session_lock(sess: str) -> asyncio.Lock:
@@ -160,10 +170,84 @@ def get_session_hdr(request: web.Request) -> str:
     return request.headers.get("X-TG-Session", "").strip()
 
 
+def clear_session_state(sess: str):
+    if not sess:
+        return
+    peer_cache.pop(sess, None)
+    inbox_queues.pop(sess, None)
+    session_max_id.pop(sess, None)
+    last_dialog_sync.pop(sess, None)
+
+
+def cache_dialog_peer(sess: str, chat_id: str, uname: str, input_ent):
+    if not sess or input_ent is None:
+        return
+    pmap = peer_cache.setdefault(sess, {})
+    if len(pmap) > 150:
+        pmap.clear()
+    if chat_id:
+        pmap[str(chat_id)] = input_ent
+    clean_u = str(uname or "").strip().lstrip("@").lower()
+    if clean_u:
+        pmap[clean_u] = input_ent
+
+
 async def safe_disconnect(cli: TelegramClient | None):
     if cli is not None:
+        attached_clients.discard(id(cli))
         try:
             await cli.disconnect()
+        except Exception:
+            pass
+
+
+def ensure_live_listener(sess: str, cli: TelegramClient):
+    if not sess or cli is None or id(cli) in attached_clients:
+        return
+    attached_clients.add(id(cli))
+    inbox_queues.setdefault(sess, deque(maxlen=24))
+
+    @cli.on(events.NewMessage(incoming=True))
+    async def _on_new_msg(event):
+        try:
+            msg = event.message
+            if not msg or msg.out:
+                return
+            mid = int(msg.id)
+            cid = str(event.chat_id if event.chat_id is not None else utils.get_peer_id(msg.peer_id))
+            ent = None
+            try:
+                ent = await event.get_chat()
+            except Exception:
+                ent = None
+            if ent is None:
+                try:
+                    ent = await event.get_sender()
+                except Exception:
+                    ent = None
+            try:
+                in_chat = await event.get_input_chat()
+            except Exception:
+                in_chat = None
+            uname = getattr(ent, "username", "") or "" if ent is not None else ""
+            cache_dialog_peer(sess, cid, uname, in_chat)
+            sender = entity_display_name(ent) if ent is not None else cid
+            txt, has_photo, too_big = msg_summary_ext(msg)
+            q = inbox_queues.setdefault(sess, deque(maxlen=24))
+            if not any(x["id"] == mid and x["chat_id"] == cid for x in q):
+                q.append(
+                    {
+                        "id": mid,
+                        "chat_id": cid,
+                        "sender": sender,
+                        "username": uname,
+                        "text": txt,
+                        "photo": bool(has_photo),
+                        "too_big": bool(too_big),
+                    }
+                )
+            if mid > session_max_id.get(sess, 0):
+                session_max_id[sess] = mid
         except Exception:
             pass
 
@@ -174,10 +258,12 @@ async def prune_caches():
         expired = [k for k, (_c, ts) in clients_cache.items() if now - ts > CLIENT_IDLE_SEC]
         for k in expired:
             cli, _ts = clients_cache.pop(k)
+            clear_session_state(k)
             await safe_disconnect(cli)
         while len(clients_cache) > MAX_CACHED_CLIENTS:
             oldest_k = min(clients_cache.keys(), key=lambda x: clients_cache[x][1])
             cli, _ts = clients_cache.pop(oldest_k)
+            clear_session_state(oldest_k)
             await safe_disconnect(cli)
 
     async with flow_lock:
@@ -208,12 +294,15 @@ async def get_authed_client(request: web.Request) -> TelegramClient | None:
         if not await cli.is_user_authorized():
             async with cache_lock:
                 clients_cache.pop(sess, None)
+            clear_session_state(sess)
             await safe_disconnect(cli)
             return None
+        ensure_live_listener(sess, cli)
         return cli
     except Exception:
         async with cache_lock:
             clients_cache.pop(sess, None)
+        clear_session_state(sess)
         await safe_disconnect(cli)
         return None
 
@@ -237,10 +326,19 @@ def can_write_entity(ent) -> bool:
     return True
 
 
-async def resolve_peer(cli: TelegramClient, chat_ref: str, username: str = ""):
+async def resolve_peer(cli: TelegramClient, chat_ref: str, username: str = "", sess: str = ""):
     ref = str(chat_ref).strip()
     if ref.lower() == "me":
         return "me"
+    uname = str(username or "").strip().lstrip("@")
+    if sess:
+        pc = peer_cache.get(sess)
+        if pc:
+            if ref in pc:
+                return pc[ref]
+            uk = (uname or ref.lstrip("@")).lower()
+            if uk and uk in pc:
+                return pc[uk]
     if ref.lstrip("-").isdigit():
         target_id = int(ref)
         try:
@@ -250,32 +348,45 @@ async def resolve_peer(cli: TelegramClient, chat_ref: str, username: str = ""):
         except Exception:
             pass
         try:
-            return await cli.get_input_entity(target_id)
+            pe = await cli.get_input_entity(target_id)
+            cache_dialog_peer(sess, ref, uname, pe)
+            return pe
         except Exception:
             pass
-        uname = str(username or "").strip().lstrip("@")
         if uname:
             try:
-                return await cli.get_input_entity(uname)
+                pe = await cli.get_input_entity(uname)
+                cache_dialog_peer(sess, ref, uname, pe)
+                return pe
             except Exception:
                 pass
         dialogs = await cli.get_dialogs(limit=100)
         for d in dialogs:
+            d_uname = getattr(d.entity, "username", "") or ""
+            cache_dialog_peer(sess, str(d.id), d_uname, d.input_entity)
             try:
                 if int(d.id) == target_id or utils.get_peer_id(d.entity) == target_id:
                     return d.input_entity
             except Exception:
                 continue
         if ref.startswith("-100") and len(ref) > 4:
-            return await cli.get_input_entity(PeerChannel(int(ref[4:])))
+            pe = await cli.get_input_entity(PeerChannel(int(ref[4:])))
+            cache_dialog_peer(sess, ref, uname, pe)
+            return pe
         if target_id < 0:
-            return await cli.get_input_entity(PeerChat(abs(target_id)))
-        return await cli.get_input_entity(PeerUser(target_id))
-    uname = ref.lstrip("@")
+            pe = await cli.get_input_entity(PeerChat(abs(target_id)))
+            cache_dialog_peer(sess, ref, uname, pe)
+            return pe
+        pe = await cli.get_input_entity(PeerUser(target_id))
+        cache_dialog_peer(sess, ref, uname, pe)
+        return pe
+    u_ref = ref.lstrip("@")
     try:
-        return await cli.get_input_entity(uname if ref.startswith("@") else ref)
+        pe = await cli.get_input_entity(u_ref if ref.startswith("@") else ref)
+        cache_dialog_peer(sess, ref, u_ref, pe)
+        return pe
     except Exception:
-        return await cli.get_entity(uname if ref.startswith("@") else ref)
+        return await cli.get_entity(u_ref if ref.startswith("@") else ref)
 
 
 async def handle_root(_request: web.Request) -> web.Response:
@@ -374,6 +485,7 @@ async def finish_login_session(dev_id: str, cli: TelegramClient, user_obj) -> st
         pending_flows.pop(dev_id, None)
     async with cache_lock:
         clients_cache[sess] = (cli, time.monotonic())
+    ensure_live_listener(sess, cli)
     uname = entity_display_name(user_obj)
     print(f"[Auth] Signed in ({dev_id}) as {uname}")
     return sess
@@ -477,15 +589,33 @@ async def handle_auth_logout(request: web.Request) -> web.Response:
             await safe_disconnect(cli)
         async with cache_lock:
             clients_cache.pop(sess, None)
+        clear_session_state(sess)
     return json_resp({"ok": True, "status": "logged_out"})
 
 
-def msg_summary(msg) -> tuple[str, bool]:
+def msg_file_size_bytes(msg) -> int:
+    fobj = getattr(msg, "file", None)
+    sz = int(getattr(fobj, "size", 0) or 0) if fobj is not None else 0
+    if sz <= 0:
+        doc = getattr(msg, "document", None) or getattr(msg, "video", None)
+        if doc is not None:
+            sz = int(getattr(doc, "size", 0) or 0)
+    return sz
+
+
+def msg_summary_ext(msg) -> tuple[str, bool, bool]:
     has_photo = bool(getattr(msg, "photo", None))
+    fsize = msg_file_size_bytes(msg)
     txt = getattr(msg, "message", None) or getattr(msg, "text", None) or ""
     txt = clean_text(txt, 200)
     if has_photo:
-        return txt, True
+        if fsize > MAX_MEDIA_BYTES:
+            return (("[Photo >4MB - too large] " + txt).strip()), False, True
+        return txt, True, False
+    if fsize > MAX_MEDIA_BYTES:
+        mb = max(1, fsize // (1024 * 1024))
+        tag = f"[File {mb}MB > limit]"
+        return (f"{tag} {txt}".strip() if txt else tag), False, True
     if not txt:
         if getattr(msg, "voice", None):
             txt = "[Voice]"
@@ -497,35 +627,45 @@ def msg_summary(msg) -> tuple[str, bool]:
             txt = "[File]"
         else:
             txt = "[Media]"
-    return txt, False
+    return txt, False, False
 
 
 async def handle_chats(request: web.Request) -> web.Response:
     cli = await get_authed_client(request)
     if cli is None:
         return json_resp({"ok": False, "error": "unauthorized"}, status=401)
-    async with get_session_lock(get_session_hdr(request)):
+    sess = get_session_hdr(request)
+    async with get_session_lock(sess):
         try:
             limit = max(1, min(12, int(request.query.get("limit", "8"))))
             dialogs = await cli.get_dialogs(limit=limit)
+            last_dialog_sync[sess] = time.monotonic()
             chats = []
+            max_id = session_max_id.get(sess, 0)
             for d in dialogs:
+                uname = getattr(d.entity, "username", "") or ""
+                cache_dialog_peer(sess, str(d.id), uname, d.input_entity)
                 last_txt = ""
                 if d.message:
-                    t, is_ph = msg_summary(d.message)
+                    mid = int(d.message.id)
+                    if mid > max_id:
+                        max_id = mid
+                    t, is_ph, _tb = msg_summary_ext(d.message)
                     last_txt = ("[Photo] " + t).strip() if is_ph else t
                     last_txt = clean_text(last_txt, 60)
                 chats.append(
                     {
                         "id": str(d.id),
                         "name": entity_display_name(d.entity),
-                        "username": getattr(d.entity, "username", "") or "",
+                        "username": uname,
                         "unread": bool(d.unread_count > 0),
                         "pinned": bool(d.pinned),
                         "can_write": can_write_entity(d.entity),
                         "last": last_txt,
                     }
                 )
+            if max_id > session_max_id.get(sess, 0):
+                session_max_id[sess] = max_id
             return json_resp({"ok": True, "chats": chats})
         except Exception as exc:
             return json_resp({"ok": False, "error": clean_text(str(exc), 80)}, status=500)
@@ -535,14 +675,15 @@ async def handle_messages(request: web.Request) -> web.Response:
     cli = await get_authed_client(request)
     if cli is None:
         return json_resp({"ok": False, "error": "unauthorized"}, status=401)
-    async with get_session_lock(get_session_hdr(request)):
+    sess = get_session_hdr(request)
+    async with get_session_lock(sess):
         try:
             chat_id = request.query.get("chat_id", "").strip()
             username = request.query.get("username", "").strip()
             if not chat_id:
                 return json_resp({"ok": False, "error": "chat_id required"}, status=400)
             limit = max(1, min(12, int(request.query.get("limit", "10"))))
-            peer = await resolve_peer(cli, chat_id, username)
+            peer = await resolve_peer(cli, chat_id, username, sess=sess)
             writable = True
             try:
                 ent = await cli.get_entity(peer)
@@ -551,18 +692,25 @@ async def handle_messages(request: web.Request) -> web.Response:
                 pass
             msgs = await cli.get_messages(peer, limit=limit)
             out = []
+            max_id = session_max_id.get(sess, 0)
             for m in reversed(msgs):
                 if m is None:
                     continue
-                txt, has_photo = msg_summary(m)
+                mid = int(m.id)
+                if mid > max_id:
+                    max_id = mid
+                txt, has_photo, too_big = msg_summary_ext(m)
                 out.append(
                     {
-                        "id": int(m.id),
+                        "id": mid,
                         "me": bool(m.out),
                         "text": txt,
                         "photo": bool(has_photo),
+                        "too_big": bool(too_big),
                     }
                 )
+            if max_id > session_max_id.get(sess, 0):
+                session_max_id[sess] = max_id
             return json_resp({"ok": True, "can_write": writable, "msgs": out})
         except Exception as exc:
             return json_resp({"ok": False, "error": clean_text(str(exc), 80)}, status=500)
@@ -572,42 +720,62 @@ async def handle_updates(request: web.Request) -> web.Response:
     cli = await get_authed_client(request)
     if cli is None:
         return json_resp({"ok": False, "error": "unauthorized"}, status=401)
-    async with get_session_lock(get_session_hdr(request)):
+    sess = get_session_hdr(request)
+    async with get_session_lock(sess):
         try:
             since = int(request.query.get("since", "0"))
-            dialogs = await cli.get_dialogs(limit=8)
-            max_id = since
-            items = []
-            for d in dialogs:
-                m = d.message
-                if not m:
-                    continue
-                mid = int(m.id)
-                if mid > max_id:
-                    max_id = mid
-                if since > 0 and mid > since and not m.out:
-                    txt, has_photo = msg_summary(m)
-                    items.append(
-                        {
-                            "id": mid,
-                            "chat_id": str(d.id),
-                            "sender": entity_display_name(d.entity),
-                            "username": getattr(d.entity, "username", "") or "",
-                            "text": txt,
-                            "photo": bool(has_photo),
-                        }
-                    )
+            q = inbox_queues.setdefault(sess, deque(maxlen=24))
+            has_queued_new = any(it["id"] > since for it in q) if since > 0 else False
+            need_sync = (since <= 0) or (sess not in session_max_id) or (
+                not has_queued_new and (time.monotonic() - last_dialog_sync.get(sess, 0.0) >= 20.0)
+            )
+            max_id = max(since, session_max_id.get(sess, 0))
+            if need_sync:
+                dialogs = await cli.get_dialogs(limit=8)
+                last_dialog_sync[sess] = time.monotonic()
+                for d in dialogs:
+                    uname = getattr(d.entity, "username", "") or ""
+                    cache_dialog_peer(sess, str(d.id), uname, d.input_entity)
+                    m = d.message
+                    if not m:
+                        continue
+                    mid = int(m.id)
+                    if mid > max_id:
+                        max_id = mid
+                    if since > 0 and mid > since and not m.out:
+                        cid = str(d.id)
+                        if not any(x["id"] == mid and x["chat_id"] == cid for x in q):
+                            txt, has_photo, too_big = msg_summary_ext(m)
+                            q.append(
+                                {
+                                    "id": mid,
+                                    "chat_id": cid,
+                                    "sender": entity_display_name(d.entity),
+                                    "username": uname,
+                                    "text": txt,
+                                    "photo": bool(has_photo),
+                                    "too_big": bool(too_big),
+                                }
+                            )
+            for it in q:
+                if it["id"] > max_id:
+                    max_id = it["id"]
+            if max_id > session_max_id.get(sess, 0):
+                session_max_id[sess] = max_id
+            items = [it for it in q if since > 0 and it["id"] > since]
             items.sort(key=lambda x: x["id"])
             return json_resp({"ok": True, "max_id": max_id, "items": items[:6]})
         except Exception as exc:
             return json_resp({"ok": False, "error": clean_text(str(exc), 80)}, status=500)
 
 
-async def _do_send_text(cli: TelegramClient, chat_id: str, username: str, text: str) -> web.Response:
+async def _do_send_text(cli: TelegramClient, chat_id: str, username: str, text: str, sess: str = "") -> web.Response:
     if not chat_id or not text:
         return json_resp({"ok": False, "error": "chat_id/text required"}, status=400)
-    peer = await resolve_peer(cli, chat_id, username)
+    peer = await resolve_peer(cli, chat_id, username, sess=sess)
     msg = await cli.send_message(peer, text)
+    if sess and int(msg.id) > session_max_id.get(sess, 0):
+        session_max_id[sess] = int(msg.id)
     print(f"[Send] OK to {chat_id} msg_id={msg.id}", flush=True)
     return json_resp({"ok": True, "id": int(msg.id)})
 
@@ -616,14 +784,15 @@ async def handle_send(request: web.Request) -> web.Response:
     cli = await get_authed_client(request)
     if cli is None:
         return json_resp({"ok": False, "error": "unauthorized"}, status=401)
-    async with get_session_lock(get_session_hdr(request)):
+    sess = get_session_hdr(request)
+    async with get_session_lock(sess):
         try:
             raw = await request.read()
             body = json.loads(raw.decode("utf-8", errors="replace"))
             chat_id = str(body.get("chat_id", "")).strip()
             username = str(body.get("username", "")).strip()
             text = str(body.get("text", ""))
-            return await _do_send_text(cli, chat_id, username, text)
+            return await _do_send_text(cli, chat_id, username, text, sess=sess)
         except Exception as exc:
             print(f"[Send] ERR POST: {exc}", flush=True)
             return json_resp({"ok": False, "error": clean_text(str(exc), 80)}, status=400)
@@ -633,12 +802,13 @@ async def handle_send_get(request: web.Request) -> web.Response:
     cli = await get_authed_client(request)
     if cli is None:
         return json_resp({"ok": False, "error": "unauthorized"}, status=401)
-    async with get_session_lock(get_session_hdr(request)):
+    sess = get_session_hdr(request)
+    async with get_session_lock(sess):
         try:
             chat_id = request.query.get("chat_id", "").strip()
             username = request.query.get("username", "").strip()
             text = request.query.get("text", "")
-            return await _do_send_text(cli, chat_id, username, text)
+            return await _do_send_text(cli, chat_id, username, text, sess=sess)
         except Exception as exc:
             print(f"[Send] ERR GET: {exc}", flush=True)
             return json_resp({"ok": False, "error": clean_text(str(exc), 80)}, status=400)
@@ -648,7 +818,8 @@ async def handle_send_photo(request: web.Request) -> web.Response:
     cli = await get_authed_client(request)
     if cli is None:
         return json_resp({"ok": False, "error": "unauthorized"}, status=401)
-    async with get_session_lock(get_session_hdr(request)):
+    sess = get_session_hdr(request)
+    async with get_session_lock(sess):
         try:
             chat_id = request.query.get("chat_id", "").strip()
             username = request.query.get("username", "").strip()
@@ -657,9 +828,11 @@ async def handle_send_photo(request: web.Request) -> web.Response:
             raw = await request.read()
             if len(raw) < 32:
                 return json_resp({"ok": False, "error": "empty image"}, status=400)
+            if len(raw) > MAX_UPLOAD_PHOTO_BYTES:
+                return json_resp({"ok": False, "error": "File too large (>1 MB)"}, status=413)
             bio = io.BytesIO(raw)
             bio.name = "lymo_photo.png"
-            peer = await resolve_peer(cli, chat_id, username)
+            peer = await resolve_peer(cli, chat_id, username, sess=sess)
             msg = await cli.send_file(peer, bio, force_document=False)
             return json_resp({"ok": True, "id": int(msg.id)})
         except Exception as exc:
@@ -670,30 +843,34 @@ async def handle_photo(request: web.Request) -> web.Response:
     cli = await get_authed_client(request)
     if cli is None:
         return web.Response(status=401, text="unauthorized")
-    async with get_session_lock(get_session_hdr(request)):
+    sess = get_session_hdr(request)
+    async with get_session_lock(sess):
         try:
             chat_id = request.query.get("chat_id", "").strip()
             msg_id = int(request.query.get("msg_id", "0"))
             if not chat_id or msg_id <= 0:
                 return web.Response(status=400, text="bad params")
-            peer = await resolve_peer(cli, chat_id)
+            peer = await resolve_peer(cli, chat_id, sess=sess)
             msg = await cli.get_messages(peer, ids=msg_id)
             if not msg:
                 return web.Response(status=404, text="not found")
+            if msg_file_size_bytes(msg) > MAX_MEDIA_BYTES:
+                return web.Response(status=413, text="File too large (>4 MB)")
             raw = await cli.download_media(msg, file=bytes)
             if not raw:
                 return web.Response(status=404, text="no media")
 
+            tw, th = 128, 96
             resamp = getattr(Image, "Resampling", Image).LANCZOS
             img = Image.open(io.BytesIO(raw)).convert("RGB")
-            img.thumbnail((96, 72), resamp)
-            canvas = Image.new("RGB", (96, 72), (24, 37, 51))
-            ox = (96 - img.width) // 2
-            oy = (72 - img.height) // 2
+            img.thumbnail((tw, th), resamp)
+            canvas = Image.new("RGB", (tw, th), (24, 37, 51))
+            ox = (tw - img.width) // 2
+            oy = (th - img.height) // 2
             canvas.paste(img, (ox, oy))
 
             out = io.BytesIO()
-            canvas.save(out, format="JPEG", quality=72, progressive=False, optimize=False)
+            canvas.save(out, format="JPEG", quality=76, progressive=False, optimize=False)
             return web.Response(body=out.getvalue(), content_type="image/jpeg")
         except Exception as exc:
             return web.Response(status=500, text=clean_text(str(exc), 80))
@@ -703,7 +880,8 @@ async def handle_resolve(request: web.Request) -> web.Response:
     cli = await get_authed_client(request)
     if cli is None:
         return json_resp({"ok": False, "error": "unauthorized"}, status=401)
-    async with get_session_lock(get_session_hdr(request)):
+    sess = get_session_hdr(request)
+    async with get_session_lock(sess):
         try:
             q = request.query.get("q", "").strip().lstrip("@")
             if len(q) < 3:
@@ -714,12 +892,17 @@ async def handle_resolve(request: web.Request) -> web.Response:
                 peer_id = "-100" + peer_id
             elif ent.__class__.__name__ == "Chat" and not peer_id.startswith("-"):
                 peer_id = "-" + peer_id
+            uname = getattr(ent, "username", "") or ""
+            try:
+                cache_dialog_peer(sess, peer_id, uname, utils.get_input_peer(ent))
+            except Exception:
+                pass
             return json_resp(
                 {
                     "ok": True,
                     "id": peer_id,
                     "name": entity_display_name(ent),
-                    "username": getattr(ent, "username", "") or "",
+                    "username": uname,
                     "can_write": can_write_entity(ent),
                 }
             )
